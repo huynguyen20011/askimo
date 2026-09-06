@@ -4,11 +4,9 @@
  */
 package io.askimo.core.memory
 
-import dev.langchain4j.data.message.AiMessage
 import dev.langchain4j.data.message.ChatMessage
 import dev.langchain4j.data.message.ChatMessageType
 import dev.langchain4j.data.message.SystemMessage
-import dev.langchain4j.data.message.UserMessage
 import dev.langchain4j.memory.ChatMemory
 import io.askimo.core.chat.domain.SessionMemory
 import io.askimo.core.chat.repository.SessionMemoryRepository
@@ -372,7 +370,19 @@ class TokenAwareSummarizingMemory(
         structuredSummary = null
         basicSummary = null
 
-        val validMessages = filteredMessages.filter { it.content.isNotBlank() }.map { it.toChatMessage() }
+        // Keep only rows that toChatMessage() can actually reconstruct: plain text messages,
+        // assistant tool-call messages, and TOOL_EXECUTION_RESULT_MESSAGE rows that have both a
+        // non-blank toolCallId AND toolName (see MemoryMessage.toChatMessage() for why both are
+        // required). Mirroring that predicate here — rather than the looser `toolCallId != null`
+        // check — keeps the "filtered out N blank messages" log below accurate, instead of
+        // undercounting rows that are dropped later by toChatMessage() for other reasons.
+        val validMessages = filteredMessages
+            .filter {
+                it.content.isNotBlank() ||
+                    it.toolExecutionRequests.isNotEmpty() ||
+                    (!it.toolCallId.isNullOrBlank() && !it.toolName.isNullOrBlank())
+            }
+            .mapNotNull { it.toChatMessage() }
 
         messages.addAll(validMessages)
 
@@ -749,7 +759,7 @@ class TokenAwareSummarizingMemory(
      */
     fun importState(state: MemoryState) {
         messages.clear()
-        messages.addAll(state.messages.map { it.toChatMessage() })
+        messages.addAll(state.messages.mapNotNull { it.toChatMessage() })
         structuredSummary = state.summary
         basicSummary = null // Clear basic summary when importing
         updatePressure()
@@ -905,12 +915,10 @@ class TokenAwareSummarizingMemory(
          * silently exceeded.
          */
         fun defaultTokenEstimator(): (ChatMessage) -> Int = { message ->
-            val text = when (message) {
-                is UserMessage -> message.singleText() ?: ""
-                is AiMessage -> message.text() ?: ""
-                is SystemMessage -> message.text() ?: ""
-                else -> ""
-            }
+            // getTextContent() (defined in MemoryMessage.kt, same package) also handles
+            // ToolExecutionResultMessage — without it, tool results were estimated as 0
+            // tokens, silently undercounting budget usage for tool-heavy conversations.
+            val text = message.getTextContent()
             (text.split("\\s+".toRegex()).size * 1.75).toInt()
         }
     }
