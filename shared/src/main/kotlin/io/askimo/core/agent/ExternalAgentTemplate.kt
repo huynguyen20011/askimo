@@ -14,6 +14,8 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Template base class for external CLI agents implementing the standard execution flow:
@@ -46,6 +48,17 @@ abstract class ExternalAgentTemplate : ExternalAgent {
 
     @Volatile
     private var resultErrorMessage: String? = null
+
+    /** The OS process for the run currently in flight, if any — see [cancel]. */
+    @Volatile
+    private var currentProcess: Process? = null
+
+    /**
+     * Set by [cancel] before killing [currentProcess], so [run] can distinguish this from a
+     * genuine process failure. Uses [AtomicBoolean] so [run]'s capture-then-clear on start is
+     * an atomic read-and-clear, not two racy steps that could drop a concurrent cancel().
+     */
+    private val cancelRequested = AtomicBoolean(false)
 
     override val lastExecutionSessionId: String?
         get() = executionSessionId
@@ -336,6 +349,43 @@ abstract class ExternalAgentTemplate : ExternalAgent {
         return found
     }
 
+    /**
+     * Shared termination sequence used by both [cancel] and the early-cancellation check in
+     * [run]: gracefully first (`Process.destroy()` — `SIGTERM` on Unix), giving the process up
+     * to 3 seconds to exit on its own so any child processes it spawned (shell commands, etc.)
+     * can clean up, then forcibly (`Process.destroyForcibly()` — `SIGKILL`) if it's still alive.
+     */
+    private fun terminateProcess(process: Process) {
+        process.destroy()
+        val exitedInTime = try {
+            process.waitFor(3, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!exitedInTime) {
+            log.debug("{} did not exit after destroy(); escalating to destroyForcibly()", id)
+            process.destroyForcibly()
+        }
+    }
+
+    /**
+     * Requests termination of the run currently in flight, if any. Sets [cancelRequested]
+     * unconditionally *before* looking at [currentProcess] — not only so [run] reports
+     * [AgentCancelledException] instead of a generic "exited with code N" error, but so a Stop
+     * click landing in the brief window between [run] starting the OS process and assigning it
+     * to [currentProcess] is still honored: [run] checks [cancelRequested] again immediately
+     * after that assignment and terminates the process itself if this method ran too early to
+     * see it. No-op (beyond recording intent) if nothing is currently tracked.
+     */
+    override fun cancel() {
+        cancelRequested.set(true)
+        val process = currentProcess ?: return
+        if (!process.isAlive) return
+        log.debug("Cancel requested for {} (pid={})", id, runCatching { process.pid() }.getOrNull())
+        terminateProcess(process)
+    }
+
     override fun run(
         systemPrompt: String,
         userInput: String,
@@ -354,6 +404,14 @@ abstract class ExternalAgentTemplate : ExternalAgent {
         updateExecutionMetadata(sessionId = resumeSessionId)
         resultErrorMessage = null
         executionUsage = null
+        // Capture-then-clear instead of a plain reset: a Stop click can land before this run()
+        // call is reached (e.g. while skills are still being materialized). getAndSet(false)
+        // does this atomically so a concurrent cancel() can't be clobbered by our own clear.
+        val cancelledBeforeStart = cancelRequested.getAndSet(false)
+        if (cancelledBeforeStart) {
+            log.debug("{} cancel() was requested before this run started; aborting immediately", id)
+            throw AgentCancelledException()
+        }
 
         log.debug(
             "Starting {} for skill execution ({} chars systemPrompt, workDir={}, resume={})",
@@ -372,95 +430,122 @@ abstract class ExternalAgentTemplate : ExternalAgent {
         }
         configureProcess(processBuilder, workDir, effectiveWorkDir, systemPrompt, userInput)
         val process = processBuilder.start()
-
-        // Drain stderr in background to prevent blocking
-        val stderrOutput = StringBuilder()
-        val stderrThread = Thread {
-            process.errorStream.bufferedReader().forEachLine { line ->
-                log.debug("{} stderr: {}", id, line)
-                stderrOutput.appendLine(line)
-                onStderrLine(line, onStatus)
-            }
-        }.also {
-            it.isDaemon = true
-            it.start()
+        currentProcess = process
+        // Honor a Stop click that landed in the tiny window between start() above and this
+        // assignment — cancel() would have set cancelRequested but found currentProcess still
+        // null/stale, so it couldn't terminate this process itself.
+        if (cancelRequested.get()) {
+            log.debug("{} cancel() was requested before process tracking began; terminating immediately", id)
+            terminateProcess(process)
         }
 
-        var stdinWriteError: IOException? = null
-
-        // Write stdin in a background thread so stdout draining starts immediately.
-        // For long agent runs the stdout pipe buffer (~64 KB) fills up fast; if we
-        // block on stdin first the agent can't write more output → deadlock → broken pipe.
-        val stdinThread = Thread {
-            try {
-                process.outputStream.bufferedWriter().use { writer ->
-                    writeStdin(writer, systemPrompt, userInput)
+        try {
+            // Drain stderr in background to prevent blocking
+            val stderrOutput = StringBuilder()
+            val stderrThread = Thread {
+                process.errorStream.bufferedReader().forEachLine { line ->
+                    log.debug("{} stderr: {}", id, line)
+                    stderrOutput.appendLine(line)
+                    onStderrLine(line, onStatus)
                 }
-            } catch (e: IOException) {
-                stdinWriteError = e
-                val isStillRunning = process.isAlive
-                val exitCode = if (!isStillRunning) process.exitValue() else -1
-                val errMsg = stderrOutput.toString().trim()
+            }.also {
+                it.isDaemon = true
+                it.start()
+            }
+
+            var stdinWriteError: IOException? = null
+
+            // Write stdin in a background thread so stdout draining starts immediately.
+            // For long agent runs the stdout pipe buffer (~64 KB) fills up fast; if we
+            // block on stdin first the agent can't write more output → deadlock → broken pipe.
+            val stdinThread = Thread {
+                try {
+                    process.outputStream.bufferedWriter().use { writer ->
+                        writeStdin(writer, systemPrompt, userInput)
+                    }
+                } catch (e: IOException) {
+                    stdinWriteError = e
+                    val isStillRunning = process.isAlive
+                    val exitCode = if (!isStillRunning) process.exitValue() else -1
+                    val errMsg = stderrOutput.toString().trim()
+                    log.debug(
+                        "Deferred stdin write error for {} (exit code: {}, running: {}): {} — stderr: {}",
+                        id,
+                        exitCode,
+                        isStillRunning,
+                        e.message,
+                        errMsg,
+                    )
+                    // Some CLIs close stdin early after consuming enough input — safe to ignore.
+                }
+            }.also {
+                it.isDaemon = true
+                it.name = "$id-stdin"
+                it.start()
+            }
+
+            // Parse stdout — runs on calling thread while stdin is written concurrently.
+            // If cancel() destroys the process mid-read, this loop simply ends (stream closes)
+            // rather than throwing — the cancelRequested check below is what reports it.
+            val output = StringBuilder()
+            process.inputStream.bufferedReader().forEachLine { line ->
+                if (line.isBlank()) return@forEachLine
+                parseStdoutLine(line, onToken, onToolCall, onStatus, onThinking, output)
+            }
+
+            // Wait for stdin to finish (it is almost always done by the time stdout is drained).
+            stdinThread.join(5_000)
+
+            val exitCode = process.waitFor()
+            stderrThread.join(2_000)
+
+            // cancel() killed this process on purpose — report a distinct cancellation outcome
+            // instead of a generic "exited with code N" error, regardless of the actual exit
+            // code or any resultErrorMessage the partial output may have triggered.
+            if (cancelRequested.get()) {
+                log.debug("{} run cancelled by user (exit code {})", id, exitCode)
+                throw AgentCancelledException()
+            }
+
+            // An application-level failure reported by the agent's own stream (e.g. "Not logged
+            // in · Please run /login") is the most accurate error message we have — prefer it over
+            // a generic "exited with code N" message, regardless of the OS exit code.
+            resultErrorMessage?.let { errMsg ->
+                error(errMsg)
+            }
+
+            if (exitCode != 0) {
+                val errMsg = buildString {
+                    val stderr = filterErrorStderr(stderrOutput.toString())
+                    if (stderr.isNotBlank()) append(stderr)
+                    stdinWriteError?.message?.takeIf { it.isNotBlank() }?.let { writeErr ->
+                        if (isNotEmpty()) append("\n")
+                        append("stdin write error: ")
+                        append(writeErr)
+                    }
+                }.trim()
+                onProcessError(exitCode, errMsg)
+                error("$name exited with code $exitCode${if (errMsg.isNotBlank()) ": $errMsg" else ""}")
+            }
+
+            if (stdinWriteError != null) {
                 log.debug(
-                    "Deferred stdin write error for {} (exit code: {}, running: {}): {} — stderr: {}",
+                    "Ignoring stdin write error for {} because process exited successfully: {}",
                     id,
-                    exitCode,
-                    isStillRunning,
-                    e.message,
-                    errMsg,
+                    stdinWriteError.message,
                 )
-                // Some CLIs close stdin early after consuming enough input — safe to ignore.
             }
-        }.also {
-            it.isDaemon = true
-            it.name = "$id-stdin"
-            it.start()
+
+            output.toString().trimEnd()
+        } finally {
+            currentProcess = null
+            cancelRequested.set(false)
         }
-
-        // Parse stdout — runs on calling thread while stdin is written concurrently.
-        val output = StringBuilder()
-        process.inputStream.bufferedReader().forEachLine { line ->
-            if (line.isBlank()) return@forEachLine
-            parseStdoutLine(line, onToken, onToolCall, onStatus, onThinking, output)
-        }
-
-        // Wait for stdin to finish (it is almost always done by the time stdout is drained).
-        stdinThread.join(5_000)
-
-        val exitCode = process.waitFor()
-        stderrThread.join(2_000)
-
-        // An application-level failure reported by the agent's own stream (e.g. "Not logged
-        // in · Please run /login") is the most accurate error message we have — prefer it over
-        // a generic "exited with code N" message, regardless of the OS exit code.
-        resultErrorMessage?.let { errMsg ->
-            error(errMsg)
-        }
-
-        if (exitCode != 0) {
-            val errMsg = buildString {
-                val stderr = filterErrorStderr(stderrOutput.toString())
-                if (stderr.isNotBlank()) append(stderr)
-                stdinWriteError?.message?.takeIf { it.isNotBlank() }?.let { writeErr ->
-                    if (isNotEmpty()) append("\n")
-                    append("stdin write error: ")
-                    append(writeErr)
-                }
-            }.trim()
-            onProcessError(exitCode, errMsg)
-            error("$name exited with code $exitCode${if (errMsg.isNotBlank()) ": $errMsg" else ""}")
-        }
-
-        if (stdinWriteError != null) {
-            log.debug(
-                "Ignoring stdin write error for {} because process exited successfully: {}",
-                id,
-                stdinWriteError.message,
-            )
-        }
-
-        output.toString().trimEnd()
     }.onFailure { e ->
-        log.error("{} run failed: {}", name, e.message, e)
+        if (e is AgentCancelledException) {
+            log.debug("{} run cancelled: {}", name, e.message)
+        } else {
+            log.error("{} run failed: {}", name, e.message, e)
+        }
     }
 }
